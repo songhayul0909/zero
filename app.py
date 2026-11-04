@@ -7,7 +7,7 @@ st.set_page_config(page_title="제로음료 영양성분 탐색", page_icon="�
 # 데이터 위치: 저장소 안의 파일 경로입니다.
 # GitHub raw 링크를 쓰려면 아래 줄을 링크로 바꾸세요.
 # 예) "https://raw.githubusercontent.com/내계정/저장소이름/main/data/zero_drinks.csv"
-DATA_SOURCE = "data/zero_drinks.csv"
+DATA_SOURCE = "zero_drinks.csv"
 
 NUTRIENTS = ["에너지_kcal", "단백질_g", "지방_g", "탄수화물_g", "당류_g", "나트륨_mg", "포화지방_g"]
 NUMERIC = NUTRIENTS + ["식품중량"]
