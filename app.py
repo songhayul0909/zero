@@ -1,6 +1,12 @@
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+from sklearn.model_selection import LeaveOneOut, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 st.set_page_config(page_title="제로음료 영양성분 탐색", page_icon="🥤", layout="wide")
 
@@ -9,7 +15,8 @@ st.set_page_config(page_title="제로음료 영양성분 탐색", page_icon="�
 # 예) "https://raw.githubusercontent.com/내계정/저장소이름/main/data/zero_drinks.csv"
 DATA_SOURCE = "zero_drinks.csv"
 
-NUTRIENTS = ["에너지_kcal", "단백질_g", "지방_g", "탄수화물_g", "당류_g", "나트륨_mg", "포화지방_g"]
+# 지방_g, 탄수화물_g는 결측치가 많아(45개 중 35개) 그래프에서 뺐습니다. 데이터 표에는 그대로 남아 있습니다.
+NUTRIENTS = ["에너지_kcal", "단백질_g", "당류_g", "나트륨_mg", "포화지방_g"]
 NUMERIC = NUTRIENTS + ["식품중량"]
 
 
@@ -56,6 +63,57 @@ if df.empty:
     st.stop()
 
 
+
+# 하루 섭취 계산기에 쓰는 영양성분과 하루 기준치(편집 가능한 기본값)
+# 나트륨 2,000mg은 식약처 영양표시 안내의 1일 기준치이고, 나머지도 영양표시에 쓰이는 일반 기준값입니다.
+INTAKE_COLS = {
+    "에너지_kcal": ("에너지", "kcal", 2000),
+    "나트륨_mg": ("나트륨", "mg", 2000),
+    "포화지방_g": ("포화지방", "g", 15),
+    "당류_g": ("당류", "g", 100),
+}
+
+
+def calc_intake(data, cups):
+    """마신 음료의 영양성분 합계 표를 만듭니다.
+    cups: {식품명: 잔 수}
+    한 잔 값 = 100ml(또는 100g)당 값 x 식품중량 / 100. 값이 비어 있으면 결측(NaN)으로 둡니다."""
+    rows = []
+    for name, n in cups.items():
+        r = data[data["식품명"] == name].iloc[0]
+        row = {"음료": name, "잔 수": n, "1잔 용량": f"{r['식품중량']:g}{r['중량단위']}"}
+        for col in INTAKE_COLS:
+            row[col] = r[col] * r["식품중량"] / 100 * n
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+
+# 분류 모델: 영양성분으로 '아이스티인지 아닌지'를 맞히는 로지스틱 회귀 (train_logreg.py와 같은 설정)
+MODEL_FEATURES = ["에너지_kcal", "단백질_g", "나트륨_mg", "포화지방_g"]
+MODEL_TARGET = "아이스티"
+
+
+def make_model():
+    # 값이 한쪽으로 치우쳐 있어 log1p로 누르고, 표준화한 뒤 규제 로지스틱 회귀를 씁니다.
+    return make_pipeline(
+        FunctionTransformer(np.log1p),
+        StandardScaler(),
+        LogisticRegression(C=1.0, class_weight="balanced", max_iter=1000),
+    )
+
+
+@st.cache_resource
+def train_model(data):
+    """100ml 기준 제품만 써서 학습하고, 제품 하나씩 빼고 맞힌 예측(Leave-One-Out)도 함께 돌려줍니다."""
+    d = data[data["기준단위"] == "100ml"].dropna(subset=MODEL_FEATURES).reset_index(drop=True)
+    X = d[MODEL_FEATURES]
+    y = (d["음료종류"] == MODEL_TARGET).astype(int)
+    loo = cross_val_predict(make_model(), X, y, cv=LeaveOneOut(), method="predict_proba")[:, 1]
+    model = make_model().fit(X, y)
+    return model, d, y, loo
+
+
 # ---------------------------------------------------------------- 그래프 도우미
 def show_hist(col, why):
     """숫자 열: 값이 어디에 몰려 있는지 보는 히스토그램"""
@@ -72,7 +130,7 @@ def show_hist(col, why):
 
 
 # ---------------------------------------------------------------- 탭
-tab1, tab2, tab3, tab4 = st.tabs(["열별 분포", "음료종류별 비교", "관계 보기(산점도)", "데이터 표"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["열별 분포", "음료종류별 비교", "관계 보기(산점도)", "데이터 표", "하루 섭취 계산기", "분류 모델"])
 
 # ===== 탭 1: 열마다 알맞은 그래프 =====
 with tab1:
@@ -122,8 +180,6 @@ with tab1:
     pairs = [
         ("에너지_kcal", "대부분 낮은 값에 몰리는지, 튀는 제품이 있는지"),
         ("단백질_g", "제품별 단백질 분포"),
-        ("지방_g", "값이 있는 제품이 적을 수 있어 개수를 함께 확인하세요"),
-        ("탄수화물_g", "값이 있는 제품이 적을 수 있어 개수를 함께 확인하세요"),
         ("당류_g", "제로 음료라도 당류가 0이 아닌 제품이 있는지"),
         ("나트륨_mg", "제품별 나트륨 분포"),
         ("포화지방_g", "제품별 포화지방 분포"),
@@ -199,3 +255,109 @@ with tab4:
         file_name="zero_drinks_filtered.csv",
         mime="text/csv",
     )
+
+
+# ===== 탭 5: 하루 섭취 계산기 =====
+with tab5:
+    st.markdown("오늘 마신 음료와 잔 수를 고르면, 에너지·나트륨·포화지방·당류가 **하루 기준치의 몇 %**인지 계산합니다. "
+                "한 잔 값은 '100ml(또는 100g)당 값 × 제품 용량 ÷ 100'으로 구하며, 왼쪽 필터와 상관없이 전체 제품에서 고릅니다.")
+
+    with st.expander("하루 기준치 바꾸기"):
+        st.caption("기본값은 영양표시에 쓰이는 일반 성인 기준값입니다. 사람마다 필요한 양은 다르니 필요하면 직접 바꾸세요.")
+        refs = {}
+        for c, (col, (label, unit, default)) in zip(st.columns(4), INTAKE_COLS.items()):
+            refs[col] = c.number_input(f"{label} ({unit})", min_value=1.0, value=float(default), step=1.0)
+
+    picked = st.multiselect("오늘 마신 음료", list(df_all["식품명"]))
+    if not picked:
+        st.info("음료를 하나 이상 고르면 계산 결과가 나옵니다.")
+    else:
+        cups = {}
+        for name in picked:
+            cups[name] = st.number_input(f"{name} · 잔 수", min_value=1, max_value=10, value=1, key=f"cups_{name}")
+
+        res = calc_intake(df_all, cups)
+        totals = {col: res[col].sum() for col in INTAKE_COLS}  # 결측은 합계에서 빠짐
+
+        st.subheader("하루 기준치 대비")
+        for c, (col, (label, unit, _)) in zip(st.columns(4), INTAKE_COLS.items()):
+            pct = totals[col] / refs[col] * 100
+            c.metric(f"{label} 합계", f"{totals[col]:,.1f} {unit}", f"기준치의 {pct:.1f}%", delta_color="off")
+
+        for col, (label, unit, _) in INTAKE_COLS.items():
+            miss = res.loc[res[col].isna(), "음료"].tolist()
+            if miss:
+                st.warning(f"{label} 값이 비어 있는 음료({', '.join(miss)})는 합계에서 빠졌습니다. 실제 {label} 합계는 이보다 클 수 있어요.")
+
+        long = []
+        for col, (label, unit, _) in INTAKE_COLS.items():
+            for _, r in res.dropna(subset=[col]).iterrows():
+                long.append({"영양성분": label, "음료": r["음료"], "기준치 대비(%)": r[col] / refs[col] * 100})
+        if long:
+            fig = px.bar(pd.DataFrame(long), x="영양성분", y="기준치 대비(%)", color="음료")
+            fig.add_hline(y=100, line_dash="dash", annotation_text="하루 기준치 100%")
+            fig.update_layout(barmode="stack", margin=dict(t=10, b=10))
+            st.plotly_chart(fig)
+
+        st.subheader("음료별 계산 내용")
+        st.dataframe(res.rename(columns={c: f"{v[0]} ({v[1]})" for c, v in INTAKE_COLS.items()}))
+
+    st.caption("참고용 계산입니다. 개인의 건강 상태에 따른 조언이 아니며, 값은 식약처 DB 화면을 보고 직접 옮겨 적은 것이라 원본과 다를 수 있습니다. "
+               "실제로 마신 용량이나 제조 방법에 따라 차이가 날 수 있습니다.")
+
+
+# ===== 탭 6: 분류 모델 =====
+with tab6:
+    st.markdown(f"영양성분(에너지, 단백질, 나트륨, 포화지방)만 보고 **'{MODEL_TARGET}'인지 아닌지**를 맞히는 로지스틱 회귀 모델입니다. "
+                "100ml 기준 제품만 쓰고, 결측이 많은 지방·탄수화물·당류는 입력에서 뺐습니다.")
+    model, md, my, loo = train_model(df_all)
+    pred = (loo >= 0.5).astype(int)
+
+    st.subheader("모델 성능")
+    st.caption("제품 하나씩 빼고 학습한 뒤 그 제품을 맞히게 하는 방식(Leave-One-Out)으로 잰 값입니다. 학습에 쓴 제품으로 잰 점수가 아닙니다.")
+    base = max(my.mean(), 1 - my.mean())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("기준선 정확도", f"{base:.2f}", help="전부 '아이스티 아님'으로 찍었을 때의 정확도")
+    c2.metric("정확도", f"{accuracy_score(my, pred):.2f}")
+    c3.metric("균형 정확도", f"{balanced_accuracy_score(my, pred):.2f}")
+    c4.metric("ROC AUC", f"{roc_auc_score(my, loo):.2f}")
+    st.caption(f"사용한 제품 {len(md)}개 (정답 1: {int(my.sum())}개, 정답 0: {int((1 - my).sum())}개). "
+               "표본이 작아서 점수는 운에 따라 크게 흔들릴 수 있고, 정답을 고르는 과정에서 잘 나오는 쪽을 택했기 때문에 실제보다 낙관적일 수 있습니다.")
+
+    st.subheader("예측해 보기")
+    mode = st.radio("예측할 제품", ["데이터에 있는 제품 고르기", "직접 입력"], horizontal=True)
+    if mode == "데이터에 있는 제품 고르기":
+        name = st.selectbox("제품", list(md["식품명"]))
+        i = int(md.index[md["식품명"] == name][0])
+        prob = float(loo[i])
+        actual = "아이스티" if my[i] == 1 else "아이스티 아님"
+        st.dataframe(md.loc[[i], ["식품명", "음료종류"] + MODEL_FEATURES])
+        st.caption("이 예측은 그 제품을 뺀 채로 학습한 모델의 결과입니다.")
+    else:
+        vals = {}
+        steps = {"에너지_kcal": 1.0, "단백질_g": 0.01, "나트륨_mg": 1.0, "포화지방_g": 0.01}
+        for c, col in zip(st.columns(4), MODEL_FEATURES):
+            vals[col] = c.number_input(col, min_value=0.0, value=float(md[col].median()), step=steps[col])
+        st.caption("100ml당 값을 넣으세요. 기본값은 이 데이터의 중앙값입니다.")
+        prob = float(model.predict_proba(pd.DataFrame([vals]))[0, 1])
+        actual = None
+
+    st.metric(f"'{MODEL_TARGET}'일 확률", f"{prob * 100:.1f}%")
+    st.progress(prob)
+    verdict = f"모델은 {MODEL_TARGET}로 판단합니다." if prob >= 0.5 else f"모델은 {MODEL_TARGET}가 아니라고 판단합니다."
+    st.write(verdict + (f" (실제: {actual})" if actual else ""))
+
+    st.subheader("어떤 성분이 영향을 줄까")
+    st.caption(f"막대가 오른쪽이면 '{MODEL_TARGET}일 가능성'을 높이고, 왼쪽이면 낮춥니다. 값은 로그 변환 후 표준화한 입력 기준 계수입니다.")
+    coef = model.named_steps["logisticregression"].coef_[0]
+    cdf = pd.DataFrame({"성분": MODEL_FEATURES, "계수": coef}).sort_values("계수")
+    fig = px.bar(cdf, x="계수", y="성분", orientation="h", text_auto=".2f")
+    fig.update_layout(margin=dict(t=10, b=10))
+    st.plotly_chart(fig)
+
+    wrong = md.assign(예측확률=loo.round(3), 정답=my)[pred != my.to_numpy()]
+    with st.expander(f"잘못 맞힌 제품 {len(wrong)}개 보기"):
+        st.dataframe(wrong[["식품명", "음료종류", "정답", "예측확률"]])
+
+    st.caption("이 모델은 데이터 안의 패턴(아이스티는 나트륨과 에너지가 낮은 경향)을 보여줄 뿐, 제로음료의 건강 효과를 증명하지 않습니다.")
+
