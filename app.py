@@ -2,11 +2,13 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import LeaveOneOut, cross_val_predict
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
+from sklearn.tree import DecisionTreeClassifier, export_text
 
 st.set_page_config(page_title="제로음료 영양성분 탐색", page_icon="🥤", layout="wide")
 
@@ -89,28 +91,35 @@ def calc_intake(data, cups):
 
 
 
-# 분류 모델: 영양성분으로 '아이스티인지 아닌지'를 맞히는 로지스틱 회귀 (train_logreg.py와 같은 설정)
+# 분류 모델: 영양성분으로 '아이스티인지 아닌지'를 맞히는 모델 3개 (train_models.py와 같은 설정)
 MODEL_FEATURES = ["에너지_kcal", "단백질_g", "나트륨_mg", "포화지방_g"]
 MODEL_TARGET = "아이스티"
+MODEL_NAMES = ["로지스틱 회귀", "결정나무", "랜덤포레스트"]
 
 
-def make_model():
-    # 값이 한쪽으로 치우쳐 있어 log1p로 누르고, 표준화한 뒤 규제 로지스틱 회귀를 씁니다.
-    return make_pipeline(
-        FunctionTransformer(np.log1p),
-        StandardScaler(),
-        LogisticRegression(C=1.0, class_weight="balanced", max_iter=1000),
-    )
+def make_model(name):
+    if name == "로지스틱 회귀":
+        # 값이 한쪽으로 치우쳐 있어 log1p로 누르고, 표준화한 뒤 규제 로지스틱 회귀를 씁니다.
+        return make_pipeline(
+            FunctionTransformer(np.log1p),
+            StandardScaler(),
+            LogisticRegression(C=1.0, class_weight="balanced", max_iter=1000),
+        )
+    if name == "결정나무":
+        # 깊이와 잎의 최소 제품 수를 제한해서 적은 데이터를 외우지 못하게 합니다.
+        return DecisionTreeClassifier(max_depth=3, min_samples_leaf=2, class_weight="balanced", random_state=0)
+    return RandomForestClassifier(n_estimators=300, max_depth=3, min_samples_leaf=2,
+                                  class_weight="balanced", random_state=0)
 
 
 @st.cache_resource
-def train_model(data):
+def train_model(data, name):
     """100ml 기준 제품만 써서 학습하고, 제품 하나씩 빼고 맞힌 예측(Leave-One-Out)도 함께 돌려줍니다."""
     d = data[data["기준단위"] == "100ml"].dropna(subset=MODEL_FEATURES).reset_index(drop=True)
     X = d[MODEL_FEATURES]
     y = (d["음료종류"] == MODEL_TARGET).astype(int)
-    loo = cross_val_predict(make_model(), X, y, cv=LeaveOneOut(), method="predict_proba")[:, 1]
-    model = make_model().fit(X, y)
+    loo = cross_val_predict(make_model(name), X, y, cv=LeaveOneOut(), method="predict_proba")[:, 1]
+    model = make_model(name).fit(X, y)
     return model, d, y, loo
 
 
@@ -308,21 +317,26 @@ with tab5:
 
 # ===== 탭 6: 분류 모델 =====
 with tab6:
-    st.markdown(f"영양성분(에너지, 단백질, 나트륨, 포화지방)만 보고 **'{MODEL_TARGET}'인지 아닌지**를 맞히는 로지스틱 회귀 모델입니다. "
+    st.markdown(f"영양성분(에너지, 단백질, 나트륨, 포화지방)만 보고 **'{MODEL_TARGET}'인지 아닌지**를 맞히는 모델 3개를 비교합니다. "
                 "100ml 기준 제품만 쓰고, 결측이 많은 지방·탄수화물·당류는 입력에서 뺐습니다.")
-    model, md, my, loo = train_model(df_all)
-    pred = (loo >= 0.5).astype(int)
 
-    st.subheader("모델 성능")
+    # 세 모델의 성능을 한 표로 비교
+    rows = []
+    for nm in MODEL_NAMES:
+        _, md0, my0, loo0 = train_model(df_all, nm)
+        p0 = (loo0 >= 0.5).astype(int)
+        rows.append({"모델": nm, "정확도": accuracy_score(my0, p0), "균형 정확도": balanced_accuracy_score(my0, p0),
+                     "F1": f1_score(my0, p0), "ROC AUC": roc_auc_score(my0, loo0)})
+    base = max(my0.mean(), 1 - my0.mean())
+    st.subheader("모델 비교")
     st.caption("제품 하나씩 빼고 학습한 뒤 그 제품을 맞히게 하는 방식(Leave-One-Out)으로 잰 값입니다. 학습에 쓴 제품으로 잰 점수가 아닙니다.")
-    base = max(my.mean(), 1 - my.mean())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("기준선 정확도", f"{base:.2f}", help="전부 '아이스티 아님'으로 찍었을 때의 정확도")
-    c2.metric("정확도", f"{accuracy_score(my, pred):.2f}")
-    c3.metric("균형 정확도", f"{balanced_accuracy_score(my, pred):.2f}")
-    c4.metric("ROC AUC", f"{roc_auc_score(my, loo):.2f}")
-    st.caption(f"사용한 제품 {len(md)}개 (정답 1: {int(my.sum())}개, 정답 0: {int((1 - my).sum())}개). "
-               "표본이 작아서 점수는 운에 따라 크게 흔들릴 수 있고, 정답을 고르는 과정에서 잘 나오는 쪽을 택했기 때문에 실제보다 낙관적일 수 있습니다.")
+    st.dataframe(pd.DataFrame(rows).round(3))
+    st.caption(f"기준선 정확도(전부 '아이스티 아님'으로 찍기) {base:.2f}. 사용한 제품 {len(md0)}개 (정답 1: {int(my0.sum())}개, 정답 0: {int((1 - my0).sum())}개). "
+               "표본이 작아서 모델 사이의 차이는 우연일 수 있고, 여러 모델 중 잘 나온 것을 고르면 실제보다 낙관적으로 보일 수 있습니다.")
+
+    name_sel = st.selectbox("자세히 볼 모델", MODEL_NAMES)
+    model, md, my, loo = train_model(df_all, name_sel)
+    pred = (loo >= 0.5).astype(int)
 
     st.subheader("예측해 보기")
     mode = st.radio("예측할 제품", ["데이터에 있는 제품 고르기", "직접 입력"], horizontal=True)
@@ -342,22 +356,31 @@ with tab6:
         prob = float(model.predict_proba(pd.DataFrame([vals]))[0, 1])
         actual = None
 
-    st.metric(f"'{MODEL_TARGET}'일 확률", f"{prob * 100:.1f}%")
+    st.metric(f"'{MODEL_TARGET}'일 확률 ({name_sel})", f"{prob * 100:.1f}%")
     st.progress(prob)
     verdict = f"모델은 {MODEL_TARGET}로 판단합니다." if prob >= 0.5 else f"모델은 {MODEL_TARGET}가 아니라고 판단합니다."
     st.write(verdict + (f" (실제: {actual})" if actual else ""))
 
-    st.subheader("어떤 성분이 영향을 줄까")
-    st.caption(f"막대가 오른쪽이면 '{MODEL_TARGET}일 가능성'을 높이고, 왼쪽이면 낮춥니다. 값은 로그 변환 후 표준화한 입력 기준 계수입니다.")
-    coef = model.named_steps["logisticregression"].coef_[0]
-    cdf = pd.DataFrame({"성분": MODEL_FEATURES, "계수": coef}).sort_values("계수")
-    fig = px.bar(cdf, x="계수", y="성분", orientation="h", text_auto=".2f")
-    fig.update_layout(margin=dict(t=10, b=10))
-    st.plotly_chart(fig)
+    st.subheader(f"{name_sel}이(가) 본 것")
+    if name_sel == "로지스틱 회귀":
+        st.caption(f"막대가 오른쪽이면 '{MODEL_TARGET}일 가능성'을 높이고, 왼쪽이면 낮춥니다. 로그 변환 후 표준화한 입력 기준 계수입니다.")
+        coef = model.named_steps["logisticregression"].coef_[0]
+        cdf = pd.DataFrame({"성분": MODEL_FEATURES, "계수": coef}).sort_values("계수")
+        fig = px.bar(cdf, x="계수", y="성분", orientation="h", text_auto=".2f")
+        fig.update_layout(margin=dict(t=10, b=10))
+        st.plotly_chart(fig)
+    elif name_sel == "결정나무":
+        st.caption("위에서부터 조건을 따라 내려가면 판정이 나옵니다. (class 1 = 아이스티)")
+        st.code(export_text(model, feature_names=MODEL_FEATURES))
+    else:
+        st.caption("값이 클수록 여러 나무에서 분류에 많이 쓰인 성분입니다. 영향의 방향(높을수록 좋은지 나쁜지)은 알려주지 않습니다.")
+        idf = pd.DataFrame({"성분": MODEL_FEATURES, "중요도": model.feature_importances_}).sort_values("중요도")
+        fig = px.bar(idf, x="중요도", y="성분", orientation="h", text_auto=".2f")
+        fig.update_layout(margin=dict(t=10, b=10))
+        st.plotly_chart(fig)
 
     wrong = md.assign(예측확률=loo.round(3), 정답=my)[pred != my.to_numpy()]
-    with st.expander(f"잘못 맞힌 제품 {len(wrong)}개 보기"):
+    with st.expander(f"{name_sel}이(가) 잘못 맞힌 제품 {len(wrong)}개 보기"):
         st.dataframe(wrong[["식품명", "음료종류", "정답", "예측확률"]])
 
-    st.caption("이 모델은 데이터 안의 패턴(아이스티는 나트륨과 에너지가 낮은 경향)을 보여줄 뿐, 제로음료의 건강 효과를 증명하지 않습니다.")
-
+    st.caption("이 모델들은 데이터 안의 패턴(아이스티는 나트륨과 에너지가 낮은 경향)을 보여줄 뿐, 제로음료의 건강 효과를 증명하지 않습니다.")
